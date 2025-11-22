@@ -99,20 +99,37 @@ const task = {
   updateTaskProgress: async (id, progress) => {
     await dbRun(`UPDATE tasks SET progress = ? WHERE id = ?`, [progress, id]);
   },
+  
+  // 【新增/修改】统一的状态和进度更新方法 (taskService 需要)
+  updateStatus: async (id, status, progress) => {
+    const updates = ['status = ?'];
+    const params = [status];
+    if (progress !== undefined) {
+        updates.push('progress = ?');
+        params.push(progress);
+    }
+    params.push(id);
+    await dbRun(`UPDATE tasks SET ${updates.join(', ')} WHERE id = ?`, params);
+  },
 
   getAllTasks: async () => {
     return dbAll(`SELECT * FROM tasks ORDER BY createdAt DESC`);
+  },
+  
+  // 【新增】删除任务方法 (taskService 需要)
+  deleteTask: async (id) => {
+    await dbRun(`DELETE FROM tasks WHERE id = ?`, [id]);
   }
 };
 
 
 module.exports = {
-  initStore, // [新增]：导出初始化函数
-  // 配置操作: 现在使用 ensureStore 确保实例存在
+  initStore, 
   config: {
     get: (key) => ensureStore().get(key),
     set: (key, val) => ensureStore().set(key, val),
     all: () => ensureStore().store
   },
-  task // 任务数据库操作
+  // 【修改】导出名称为 taskDB，与 taskService.js 中的解构匹配
+  taskDB: task 
 };
