@@ -1,131 +1,138 @@
+// src/main/coreServices/taskService.js
 const { EventEmitter } = require('events');
-// 【修复】确保 taskDB 和 config 导入正确
-const { taskDB, config } = require('./storageService'); 
-const { downloadVideoTask } = require('../business/videoDownload/downloader');
+const { taskDB, config } = require('./storageService');
+// [修改] 引入 SegmentDownloader 类
+const SegmentDownloader = require('../business/videoDownload/segmentDownloader');
 
 class TaskService extends EventEmitter {
   constructor() {
     super();
     this.queue = [];
-    this.activeTasks = new Map(); 
-    // 【注意】虽然 init() 中有数据库操作，但 main.js 已保证 initStore() 在 require(taskService) 前完成。
+    this.activeTasks = new Map(); // 存储 { taskId: downloaderInstance }
     this.maxConcurrent = config.get('download.maxConcurrent') || 3;
-    this.isRunning = false;
-    
-    // 启动时恢复未完成任务状态
     this.init();
   }
 
   async init() {
-    // 【修复】使用正确的数据库方法名
-    const tasks = await taskDB.getAllTasks(); 
-    // 将意外中断的 'downloading' 任务重置为 'paused'
+    const tasks = await taskDB.getAllTasks();
     for (const task of tasks) {
       if (task.status === 'downloading') {
-        // 【修复】使用新的更新状态方法
-        await taskDB.updateStatus(task.id, 'paused'); 
+        await taskDB.updateStatus(task.id, 'paused');
       }
     }
+    this.emit('update', await this.getAllTasks());
   }
 
-  // 添加任务
   async addTask(taskData) {
     const task = {
       id: taskData.id || Date.now().toString(),
-      type: 'video',
+      type: taskData.type || 'video', // 支持 video 或 article
       title: taskData.title,
       status: 'pending',
       progress: 0,
       meta: {
         url: taskData.url,
         m3u8Url: taskData.m3u8Url,
+        cid: taskData.cid,
+        bvid: taskData.bvid,
         savePath: taskData.savePath || config.get('download.path'),
         cookie: taskData.cookie
       }
     };
 
-    // 【修复】使用正确的数据库方法名
     await taskDB.addTask(task);
-    this.emit('update', await this.getAllTasks()); 
+    this.emit('update', await this.getAllTasks());
     this.processQueue();
     return task.id;
   }
 
-  // 获取所有任务
   async getAllTasks() {
-    // 【修复】使用正确的数据库方法名
     return await taskDB.getAllTasks();
   }
 
-  // 开始/恢复任务
   async resumeTask(taskId) {
-    // 【修复】使用正确的更新状态方法
     await taskDB.updateStatus(taskId, 'pending');
     this.emit('update', await this.getAllTasks());
     this.processQueue();
   }
 
-  // 暂停任务
   async pauseTask(taskId) {
-    const controller = this.activeTasks.get(taskId);
-    if (controller) {
-      controller.abort(); 
+    const downloader = this.activeTasks.get(taskId);
+    if (downloader) {
+      // [修改] 调用实例的 pause 方法
+      if (typeof downloader.pause === 'function') {
+          downloader.pause();
+      } else if (downloader.abort) {
+          downloader.abort(); // 兼容 AbortController
+      }
       this.activeTasks.delete(taskId);
     }
-    // 【修复】使用正确的更新状态方法
     await taskDB.updateStatus(taskId, 'paused');
     this.emit('update', await this.getAllTasks());
-    this.processQueue(); 
+    this.processQueue();
   }
 
-  // 删除任务
   async deleteTask(taskId) {
-    await this.pauseTask(taskId); 
-    // 【修复】使用正确的数据库方法名
+    await this.pauseTask(taskId);
     await taskDB.deleteTask(taskId);
     this.emit('update', await this.getAllTasks());
   }
 
-  // 队列调度核心 (保持不变)
+  async processQueue() {
+    if (this.activeTasks.size >= this.maxConcurrent) return;
+    const tasks = await taskDB.getAllTasks();
+    const nextTask = tasks.find(t => t.status === 'pending');
+    if (!nextTask) return;
+    this.runTask(nextTask);
+  }
 
   async runTask(task) {
-    this.activeTasks.set(task.id, new AbortController()); 
-    
     try {
-      // 【修复】使用正确的更新状态方法
       await taskDB.updateStatus(task.id, 'downloading');
       this.emit('update', await this.getAllTasks());
 
-      const signal = this.activeTasks.get(task.id).signal;
+      // [关键逻辑] 根据任务类型选择下载器
+      let downloader;
       
-      // 调用下载器
-      await downloadVideoTask({
-        ...task.meta,
-        id: task.id,
-        title: task.title
-      }, async (progress) => {
-        // 进度回调：节流更新数据库，实时发送给前端
-        if (Math.random() > 0.5 || progress === 100) {
-             // 【修复】使用正确的更新状态方法
-             await taskDB.updateStatus(task.id, 'downloading', progress);
-        }
-        this.emit('progress', { taskId: task.id, progress });
-      }, signal);
+      if (task.type === 'video') {
+          downloader = new SegmentDownloader(task);
+      } else if (task.type === 'article') {
+          // 稍后实现 ArticleDownloader
+          const { downloadArticle } = require('../business/articleCrawl/articleCrawler');
+          downloader = { 
+              start: () => downloadArticle(task, (p) => downloader.emit('progress', p)),
+              pause: () => {}, // 专栏下载暂不支持暂停
+              on: (evt, cb) => { if(evt==='progress') downloader._cb = cb; },
+              emit: (evt, val) => { if(downloader._cb) downloader._cb(val); }
+          };
+      }
 
-      // 【修复】使用正确的更新状态方法
+      this.activeTasks.set(task.id, downloader);
+
+      // 监听进度
+      downloader.on('progress', async (progress) => {
+         // 节流更新数据库，实时发送给前端
+         if (Math.random() > 0.8 || progress === 100) {
+             await taskDB.updateStatus(task.id, 'downloading', progress);
+         }
+         this.emit('progress', { taskId: task.id, progress });
+      });
+
+      // 开始下载
+      await downloader.start();
+
       await taskDB.updateStatus(task.id, 'completed', 100);
     } catch (err) {
-      if (err.message === 'Aborted') {
-        // 是被暂停的，状态已经在 pauseTask 中处理了
+      console.error(`Task failed: ${err.message}`);
+      if (err.message.includes('paused') || err.message.includes('Aborted')) {
+          // 暂停状态已处理
       } else {
-        console.error(`Task failed: ${err.message}`);
-        // 【修复】使用正确的更新状态方法
-        await taskDB.updateStatus(task.id, 'error');
+          await taskDB.updateStatus(task.id, 'error');
       }
     } finally {
       this.activeTasks.delete(task.id);
       this.emit('update', await this.getAllTasks());
-      this.processQueue(); 
+      this.processQueue();
     }
   }
 }

@@ -1,126 +1,135 @@
-// 文件: src/main/main.js
 const { app, BrowserWindow, ipcMain, shell } = require('electron');
 const path = require('path');
-// 导入 coreServices
 const storageService = require('./coreServices/storageService');
 const securityService = require('./coreServices/securityService');
+const authService = require('./business/auth/authService'); // 引入鉴权服务
+const linkParser = require('./business/videoDownload/linkParser');
+// 专栏下载器需要在这里 require 一次，确保其逻辑被加载
+require('./business/articleCrawl/articleCrawler'); 
 
-// 【修复】清理和简化导入，只导入实例
-const linkParser = require('./business/videoDownload/linkParser'); 
-// downloader.js 模块现在只被 taskService.js 使用，不需要在这里导入。
 
 let mainWindow;
-let taskServiceInstance; 
+let taskServiceInstance;
 
 function createWindow() {
   mainWindow = new BrowserWindow({
-    width: 1200,
+    width: 1280, 
     height: 800,
+    minWidth: 900,
+    minHeight: 600,
+    frame: true, 
+    backgroundColor: '#f3f2f1', 
     webPreferences: {
       preload: path.join(__dirname, 'preload.js'),
-      contextIsolation: true
+      contextIsolation: true,
+      nodeIntegration: false,
+      webSecurity: false 
     }
   });
-  // 注意：Vite 可能会使用不同的端口，请确保端口号与 vite.config.js 一致
-  mainWindow.loadURL('http://localhost:5173'); 
+
+  mainWindow.loadURL('http://localhost:5173');
+
+  mainWindow.on('ready-to-show', () => {
+    mainWindow.show();
+  });
+
   registerIpcHandlers();
 }
 
-/**
- * 注册 IPC 处理器
- */
 function registerIpcHandlers() {
-  // 解析视频URL
-  ipcMain.handle('video:parse-url', async (_, url, cookie) => {
+  // --- 鉴权相关 IPC ---
+  ipcMain.handle('auth:get-qrcode', async () => authService.getQRCode());
+  ipcMain.handle('auth:poll-qrcode', async (_, key) => authService.pollQRCode(key));
+  ipcMain.handle('auth:get-user-info', async () => authService.getUserInfo());
+  ipcMain.handle('auth:import-cookie', async (_, cookie) => authService.importCookie(cookie));
+  ipcMain.handle('auth:logout', async () => {
+    authService.logout();
+    return { success: true };
+  });
+
+  // --- 视频与专栏解析 IPC ---
+  ipcMain.handle('video:parse-url', async (_, url) => {
     try {
-      if (cookie) securityService.setCookie(cookie); 
-      
-      // 【修复】使用 linkParser 导出的实例的 parse 方法
+      const cookie = securityService.getCookie();
       const data = await linkParser.parse(url, cookie);
-      
       return { success: true, data };
     } catch (err) {
       return { success: false, error: err.message };
     }
   });
+  
+  // 专栏解析 IPC
+  ipcMain.handle('article:parse-url', async (_, url) => {
+     if (url.includes('bilibili.com/read/cv')) {
+         return { success: true, data: { title: 'B站专栏', url } };
+     }
+     return { success: false, error: '无效的专栏链接' };
+  });
 
-  // 开始下载任务
+  // --- 任务管理 IPC ---
   ipcMain.handle('video:start-download', async (_, task) => {
+    if (!taskServiceInstance) return { success: false, error: '服务未初始化' };
+    
     const taskDetails = { 
         ...task, 
-        type: 'video', 
-        status: 'pending' 
+        type: task.type || 'video', 
+        status: 'pending',
+        cookie: securityService.getCookie() // 注入最新 Cookie
     };
+    
     try {
-      // 【修复】必须等待 taskService.addTask 完成
-      const taskId = await taskServiceInstance.addTask(taskDetails); 
-      
-      // 【移除】移除了冗余的 downloadVideoTask 启动逻辑，交给 taskService 队列调度
-      
+      const taskId = await taskServiceInstance.addTask(taskDetails);
       return { success: true, taskId };
     } catch (err) {
       return { success: false, error: err.message };
     }
   });
-  
-  // 【新增】任务控制 IPC 处理器 (暂停、恢复、删除)
+
   ipcMain.on('task:control', async (event, { action, taskId }) => {
     if (!taskServiceInstance) return;
-
     try {
         switch (action) {
-            case 'pause':
-                await taskServiceInstance.pauseTask(taskId);
-                break;
-            case 'resume':
-                await taskServiceInstance.resumeTask(taskId);
-                break;
-            case 'delete':
-                await taskServiceInstance.deleteTask(taskId);
-                break;
+            case 'pause': await taskServiceInstance.pauseTask(taskId); break;
+            case 'resume': await taskServiceInstance.resumeTask(taskId); break;
+            case 'delete': await taskServiceInstance.deleteTask(taskId); break;
         }
-    } catch (error) {
-        console.error(`Task control action failed for ${action} ${taskId}:`, error);
-    }
+    } catch (e) { console.error(e); }
   });
-  
-  // 【新增】获取所有任务列表（供渲染进程启动时拉取）
+
   ipcMain.handle('task:get-all', async () => {
       return taskServiceInstance ? await taskServiceInstance.getAllTasks() : [];
   });
+
+  // --- 配置 IPC ---
+  ipcMain.handle('config:get', (_, key) => storageService.config.get(key));
+  ipcMain.handle('config:set', (_, key, val) => storageService.config.set(key, val));
 }
 
-/**
- * 异步初始化应用的主入口
- */
 async function initApp() {
   try {
-    // 1. 必须首先初始化 Store 
-    await storageService.initStore(); 
-    
-    // 2. 初始化 SecurityService (它依赖 Store 中的配置)
+    await storageService.initStore();
     securityService.init();
-
-    // 3. 延迟加载 taskService 
-    taskServiceInstance = require('./coreServices/taskService'); 
     
-    // 【新增】监听 taskService 事件并转发给渲染进程
+    // 延迟加载 TaskService
+    taskServiceInstance = require('./coreServices/taskService');
+    
+    // 事件转发
     taskServiceInstance.on('update', (tasks) => {
-        // 使用可选链操作符防止窗口未完全加载
-        mainWindow?.webContents.send('task:update-list', tasks); 
+        if(mainWindow && !mainWindow.isDestroyed()) mainWindow.webContents.send('task:update-list', tasks);
     });
     taskServiceInstance.on('progress', (data) => {
-        mainWindow?.webContents.send('video:download-progress', data);
+        if(mainWindow && !mainWindow.isDestroyed()) mainWindow.webContents.send('video:download-progress', data);
     });
 
-    // 4. 准备就绪后创建窗口
     app.whenReady().then(createWindow);
     
+    app.on('window-all-closed', () => {
+      if (process.platform !== 'darwin') app.quit();
+    });
   } catch (error) {
     console.error('Application initialization failed:', error);
     app.quit();
   }
 }
 
-// 启动应用初始化
 initApp();
