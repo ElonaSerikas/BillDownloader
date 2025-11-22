@@ -71,7 +71,8 @@
     "fs-extra": "^11.3.2",
     "m3u8-parser": "^7.2.0",
     "react": "18.2.0",
-    "react-dom": "18.2.0"
+    "react-dom": "18.2.0",
+    "sqlite3": "^5.1.7"
   },
   "devDependencies": {
     "@vitejs/plugin-react": "^5.1.1",
