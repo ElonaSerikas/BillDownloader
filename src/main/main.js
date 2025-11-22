@@ -1,43 +1,55 @@
 const { app, BrowserWindow, ipcMain } = require('electron');
 const path = require('path');
-const { initIpcHandlers } = require('./ipcHandlers');
-const Store = require('electron-store');
+const { parseVideoUrl } = require('./business/videoDownload/parser');
+const { downloadVideoTask } = require('./business/videoDownload/downloader');
+const taskService = require('./coreServices/taskService');
 
-// 初始化配置存储（工程名相关设置）
-const store = new Store({
-  name: 'bili-downloader-config', // 配置文件名
-  defaults: {
-    downloadPath: path.join(app.getPath('desktop'), 'BiliDownloads'), // 下载目录
-    concurrency: 3,
-    videoQuality: '1080P',
-    notifySound: true
-  }
-});
-
-global.sharedState = { store };
+let mainWindow;
 
 function createWindow() {
-  const mainWindow = new BrowserWindow({
+  mainWindow = new BrowserWindow({
     width: 1200,
     height: 800,
     webPreferences: {
       preload: path.join(__dirname, 'preload.js'),
-      contextIsolation: true,
-      nodeIntegration: false
-    },
-    title: 'BiliDownloader', // 窗口标题
-    frame: false
+      contextIsolation: true
+    }
+  });
+  mainWindow.loadURL('http://localhost:5173'); // 开发环境
+  registerIpcHandlers();
+}
+
+// 注册IPC处理器
+function registerIpcHandlers() {
+  // 解析视频URL
+  ipcMain.handle('video:parse-url', async (_, url, cookie) => {
+    try {
+      const data = await parseVideoUrl(url, cookie);
+      return { success: true, data };
+    } catch (err) {
+      return { success: false, error: err.message };
+    }
   });
 
-  // 开发环境加载Vite服务器
-  mainWindow.loadURL('http://localhost:5173');
-  // 生产环境：mainWindow.loadFile('dist/index.html')
-
-  initIpcHandlers(mainWindow);
+  // 开始下载任务
+  ipcMain.handle('video:start-download', async (_, task) => {
+    try {
+      const taskId = taskService.addTask(task); // 添加到任务队列
+      // 执行下载并同步进度到渲染进程
+      downloadVideoTask({ ...task, id: taskId }, (progress) => {
+        mainWindow.webContents.send('video:download-progress', {
+          taskId,
+          progress,
+          title: task.title
+        });
+      }).then(() => {
+        mainWindow.webContents.send('video:download-complete', { taskId });
+      });
+      return { success: true, taskId };
+    } catch (err) {
+      return { success: false, error: err.message };
+    }
+  });
 }
 
 app.whenReady().then(createWindow);
-
-app.on('window-all-closed', () => {
-  if (process.platform !== 'darwin') app.quit();
-});
