@@ -1,6 +1,7 @@
 const axios = require('axios');
-const { Agent } = require('agentkeepalive');
-const { getCookie } = require('../coreServices/securityService');
+const Agent = require('agentkeepalive'); 
+const { getHeaders, getCookie } = require('../coreServices/securityService');
+const { getProxy } = require('../coreServices/storageService').config;
 
 // 初始化长连接代理（复用TCP连接）
 const keepaliveAgent = new Agent({

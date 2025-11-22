@@ -4,113 +4,115 @@ const { app } = require('electron');
 const fs = require('fs-extra');
 
 // --- 存储实例 ---
-let store;
-let isInitialized = false;
+let db;
+let dbReady = false;
+let storeInstance = null; // 用于保存 electron-store 实例
 
+/**
+ * 异步初始化 Electron Store。必须在任何同步访问 config 之前调用。
+ */
+async function initStore() {
+  if (storeInstance) return;
 
-// 1. 用户配置存储 (Electron-store)
-const store = new Store({
-  defaults: {
-    'download.path': path.join(app.getPath('downloads'), 'BiliDownloader'),
-    'download.maxConcurrent': 3,
-    'network.proxy': '',
-    'user.cookie': ''
+  // 1. 用户配置存储 (Electron-store)
+  // [关键修改] 使用动态 import() 异步加载 ESM 模块
+  const { default: Store } = await import('electron-store'); 
+
+  storeInstance = new Store({
+    defaults: {
+      'download.path': path.join(app.getPath('downloads'), 'BiliDownloader'),
+      'download.maxConcurrent': 3,
+      'network.proxy': '',
+      'user.cookie': '',
+      'network.userAgent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/114.0.0.0 Safari/537.36',
+    }
+  });
+
+  // 2. 任务数据库存储 (SQLite)
+  const dbPath = path.join(app.getPath('userData'), 'database', 'tasks.db');
+  fs.ensureDirSync(path.dirname(dbPath));
+
+  db = new sqlite3.Database(dbPath, (err) => {
+    if (err) {
+      console.error('Error opening database:', err.message);
+    } else {
+      dbReady = true;
+      // 初始化表结构
+      db.run(`
+        CREATE TABLE IF NOT EXISTS tasks (
+          id TEXT PRIMARY KEY,
+          title TEXT,
+          type TEXT NOT NULL,
+          url TEXT,
+          status TEXT, -- pending, downloading, paused, completed, error
+          progress REAL,
+          episodeId TEXT,
+          m3u8Url TEXT,
+          createdAt INTEGER
+        )
+      `);
+    }
+  });
+}
+
+// 辅助函数：确保 Store 实例已加载
+const ensureStore = () => {
+  if (!storeInstance) {
+    throw new Error("Electron Store has not been initialized. Please call storageService.initStore() in main.js before use.");
   }
-});
+  return storeInstance;
+}
 
-// 2. 任务数据库存储 (SQLite)
-const dbDir = path.join(app.getPath('userData'), 'database');
-fs.ensureDirSync(dbDir);
-const dbPath = path.join(dbDir, 'tasks.db');
-
-const db = new sqlite3.Database(dbPath);
-
-// 初始化表结构
-db.serialize(() => {
-  db.run(`
-    CREATE TABLE IF NOT EXISTS tasks (
-      id TEXT PRIMARY KEY,
-      type TEXT NOT NULL,
-      title TEXT,
-      status TEXT, -- pending, downloading, paused, completed, error
-      progress INTEGER DEFAULT 0,
-      total_size TEXT,
-      created_at INTEGER,
-      meta_data TEXT -- 存储JSON格式的元数据(url, cover, quality等)
-    )
-  `);
-});
-
-// Promise化数据库操作
-const dbRun = (sql, params) => new Promise((resolve, reject) => {
-  db.run(sql, params, function(err) {
-    if (err) reject(err);
-    else resolve(this);
+// Promise化数据库操作（保持不变）
+const dbRun = (sql, params = []) => {
+  if (!dbReady) throw new Error('Database not ready');
+  return new Promise((resolve, reject) => {
+    db.run(sql, params, function (err) {
+      if (err) reject(err);
+      else resolve({ changes: this.changes, lastID: this.lastID });
+    });
   });
-});
+};
 
-const dbAll = (sql, params) => new Promise((resolve, reject) => {
-  db.all(sql, params, (err, rows) => {
-    if (err) reject(err);
-    else resolve(rows);
+const dbAll = (sql, params = []) => {
+  if (!dbReady) throw new Error('Database not ready');
+  return new Promise((resolve, reject) => {
+    db.all(sql, params, (err, rows) => {
+      if (err) reject(err);
+      else resolve(rows);
+    });
   });
-});
+};
 
-const dbGet = (sql, params) => new Promise((resolve, reject) => {
-  db.get(sql, params, (err, row) => {
-    if (err) reject(err);
-    else resolve(row);
-  });
-});
+
+// 数据库操作接口
+const task = {
+  addTask: async (taskData) => {
+    const { id, title, type, url, status, progress, episodeId, m3u8Url } = taskData;
+    const createdAt = Date.now();
+    await dbRun(`
+      INSERT INTO tasks (id, title, type, url, status, progress, episodeId, m3u8Url, createdAt)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+    `, [id, title, type, url, status, progress, episodeId, m3u8Url, createdAt]);
+  },
+
+  updateTaskProgress: async (id, progress) => {
+    await dbRun(`UPDATE tasks SET progress = ? WHERE id = ?`, [progress, id]);
+  },
+
+  getAllTasks: async () => {
+    return dbAll(`SELECT * FROM tasks ORDER BY createdAt DESC`);
+  }
+};
+
 
 module.exports = {
-  // 配置操作
+  initStore, // [新增]：导出初始化函数
+  // 配置操作: 现在使用 ensureStore 确保实例存在
   config: {
-    get: (key) => store.get(key),
-    set: (key, val) => store.set(key, val),
-    all: () => store.store
+    get: (key) => ensureStore().get(key),
+    set: (key, val) => ensureStore().set(key, val),
+    all: () => ensureStore().store
   },
-  
-  // 任务操作
-  taskDB: {
-    addTask: async (task) => {
-      const sql = `INSERT OR REPLACE INTO tasks (id, type, title, status, progress, created_at, meta_data) VALUES (?, ?, ?, ?, ?, ?, ?)`;
-      return dbRun(sql, [
-        task.id, 
-        task.type, 
-        task.title, 
-        task.status || 'pending', 
-        task.progress || 0, 
-        Date.now(), 
-        JSON.stringify(task.meta || {})
-      ]);
-    },
-    
-    updateStatus: async (id, status, progress) => {
-      // 如果进度存在则更新，否则只更新状态
-      if (progress !== undefined) {
-        return dbRun(`UPDATE tasks SET status = ?, progress = ? WHERE id = ?`, [status, progress, id]);
-      } else {
-        return dbRun(`UPDATE tasks SET status = ? WHERE id = ?`, [status, id]);
-      }
-    },
-
-    deleteTask: async (id) => {
-      return dbRun(`DELETE FROM tasks WHERE id = ?`, [id]);
-    },
-    
-    getAll: async () => {
-      const rows = await dbAll(`SELECT * FROM tasks ORDER BY created_at DESC`);
-      return rows.map(row => ({
-        ...row,
-        meta: JSON.parse(row.meta_data || '{}')
-      }));
-    },
-    
-    get: async (id) => {
-      const row = await dbGet(`SELECT * FROM tasks WHERE id = ?`, [id]);
-      if (row) row.meta = JSON.parse(row.meta_data || '{}');
-      return row;
-    }
-  }
+  task // 任务数据库操作
 };
